@@ -14,16 +14,16 @@ Deployment on Render.com:
        CEREBRAS_API_KEY – Your Cerebras API key
      (No PORT or WEBHOOK_URL needed; Render sets them automatically.)
   3. Build command: pip install -r requirements.txt
-  4. Start command: python bot.py
+  4. Start command: python kozakai_standalone.py
   5. The bot will set its webhook to https://<your-service>.onrender.com/<TOKEN>
 
-Requirements (see also requirements.txt):
-  python-telegram-bot>=20.0
-  openai>=1.0.0
-  aiohttp (automatically installed with python-telegram-bot)
+Requirements (create a requirements.txt with these contents):
+    python-telegram-bot>=20.0,<21
+    openai>=1.0.0
+    aiohttp
 
 Run tests locally:
-  python bot.py --test
+    python kozakai_standalone.py --test
 """
 
 import os
@@ -35,7 +35,10 @@ import logging
 import asyncio
 
 # Third-party imports
-from telegram import Update, Chat, ChatAction, MessageEntity as MessageEntityType
+# Fix: ChatAction is now in telegram.constants (python-telegram-bot >=20.0)
+from telegram import Update, Chat
+from telegram.constants import ChatAction
+from telegram import MessageEntity as MessageEntityType
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -149,11 +152,11 @@ async def generate_ai_response(user_message: str) -> str:
     """
     client = get_cerebras_client()
     system_prompt = (
-        "Ти - український козак із Галичини на ім'я Синевир. "
+        "Ти - український козак із Галичини на ім'я Вася. "
         "Говори галицьким діалектом, використовуй автентичну лексику, "
         "приказки, вульгаризми. Відповідай дотепно, сміливо, з козацькою вдачею. "
         "Відповідай українською мовою або суржиком."
-        "Відповідай курячи сигару і по-філософськи"
+        "Відповідай як філософ часто курячи сигару"
     )
     try:
         response = await client.chat.completions.create(
@@ -293,7 +296,7 @@ async def main() -> None:
 
 
 # ----------------------------------------------------------------------
-# Unit tests (run with python bot.py --test)
+# Unit tests (run with python kozakai_standalone.py --test)
 # ----------------------------------------------------------------------
 def run_tests() -> None:
     """Run unit tests for core functions."""
@@ -308,7 +311,6 @@ def run_tests() -> None:
 
         def test_stylize_contains_opening_or_closing(self):
             result = stylize_response("Щось")
-            # It should contain at least one opening substring or closing
             has_opening = any(op in result for op in OPENINGS)
             has_closing = any(cl in result for cl in CLOSINGS)
             self.assertTrue(has_opening or has_closing, msg="No Kozak flair injected")
@@ -338,7 +340,6 @@ def run_tests() -> None:
         # ---------- generate_ai_response ----------
         @patch.dict(os.environ, {"CEREBRAS_API_KEY": "test-key"})
         async def test_generate_ai_response_success(self):
-            """Mock Cerebras API to return a phrase."""
             mock_response = MagicMock()
             mock_response.choices = [
                 MagicMock(message=MagicMock(content="  Відповідь козака  "))
@@ -346,12 +347,10 @@ def run_tests() -> None:
             mock_client = AsyncMock()
             mock_client.chat.completions.create.return_value = mock_response
 
-            with patch(
-                "openai.AsyncOpenAI", return_value=mock_client
-            ) as mock_constructor:
+            with patch("openai.AsyncOpenAI", return_value=mock_client) as mc:
                 response = await generate_ai_response("Чи ти козак?")
                 self.assertEqual(response, "Відповідь козака")
-                mock_constructor.assert_called_once_with(
+                mc.assert_called_once_with(
                     api_key="test-key", base_url="https://api.cerebras.ai/v1"
                 )
 
@@ -375,21 +374,22 @@ def run_tests() -> None:
                 with self.assertRaises(openai.APIError):
                     await generate_ai_response("Hello")
 
-    # Load and run the test suite
-    suite = unittest.TestLoader().loadTestsFromTestCase(TestKozakAI)
-    runner = unittest.TextTestRunner(verbosity=2)
-    # asyncio tests need special handling
-    # Patch the loop to run async tests synchronously
-    import inspect
+    # Run the tests (handles async tests correctly)
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromTestCase(TestKozakAI)
 
-    # Simple async runner for test methods
+    # Make the async tests run in the event loop
     for test_case in suite:
-        for test_method in test_case:
-            if inspect.iscoroutinefunction(getattr(test_case.__class__, test_method._testMethodName)):
-                # Wrap async test so it runs synchronously inside unittest
-                orig = getattr(test_case, test_method._testMethodName)
-                setattr(test_case, test_method._testMethodName, lambda tc=test_case, m=orig: asyncio.get_event_loop().run_until_complete(m()))
-    runner.run(suite)
+        for test in test_case:
+            if asyncio.iscoroutinefunction(test._testMethodName):
+                orig = getattr(test_case, test._testMethodName)
+                def make_wrapper(m=orig):
+                    def wrapper(tc):
+                        return asyncio.run(m(tc))
+                    return wrapper
+                setattr(test_case, test._testMethodName, make_wrapper())
+
+    unittest.TextTestRunner(verbosity=2).run(suite)
 
 
 # ----------------------------------------------------------------------
