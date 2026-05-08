@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-KozakAI Telegram Bot – Синевир, the Cossack Warrior
-=====================================================
-- Starts an immediate dummy TCP listener to satisfy Render’s port check.
-- Then loads PTB + Cerebras, sets webhook, and replaces dummy with real bot.
-- Responds only when @bot_username is mentioned or its message replied to.
-- Speaks like a Halychynian Kozak (Синевир) with traditional flair.
+KozakAI Telegram Bot – Синевир, the Halychynian Cossack (with memory + keyword trigger)
+=========================================================================================
+- Responds in groups when someone writes @kozak_aibot, replies to the bot,
+  or includes any of the trigger words (case‑insensitive) in the message:
+    козак, козаче, друже, синевир, синевире, козакai, kozakai, синевирai
+- Maintains the last 20 messages as conversation history (per chat).
+- Deploys on Render.com (Python 3.12) using a dummy listener for instant port binding.
 """
 
-import os, sys, re, random, logging, asyncio, time
+import os
+import sys
+import re
+import random
+import logging
+import asyncio
 
-# ----------------------------------------------------------------------
-# Print immediately so Render logs show progress
-# ----------------------------------------------------------------------
-print("=== KozakAI starting (dummy listener) ===", flush=True)
+print("=== KozakAI Синевир starting ===", flush=True)
 
-# ----------------------------------------------------------------------
-# Logging to stdout (Render captures it)
-# ----------------------------------------------------------------------
 logging.basicConfig(
     stream=sys.stdout,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -26,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
-# Kozak speech constants (no heavy imports needed)
+# Kozak flair constants
 # ----------------------------------------------------------------------
 OPENINGS = [
     "Ото ж бо, ",
@@ -62,7 +62,6 @@ SWEAR_WORDS = [
 ]
 
 def stylize_response(text: str) -> str:
-    """Inject Kozak flair, opening/closing phrases and occasional swear word."""
     if not text:
         text = "Нічого не скажу."
     opening = random.choice(OPENINGS)
@@ -71,98 +70,120 @@ def stylize_response(text: str) -> str:
         text = f"{random.choice(SWEAR_WORDS)}, {text}"
     return f"{opening}{text}{closing}".strip()
 
+# ----------------------------------------------------------------------
+# Trigger keywords (any of these in a group message will activate the bot)
+# ----------------------------------------------------------------------
+TRIGGER_WORDS = [
+    "козак", "козаче", "друже", "синевир", "синевире",
+    "козакai", "kozakai", "синевирai",
+]
+
+def contains_trigger(text: str) -> bool:
+    """Return True if the text contains any trigger word (case‑insensitive)."""
+    lower = text.lower()
+    return any(word in lower for word in TRIGGER_WORDS)
+
 def remove_mention(text: str, bot_username: str) -> str:
-    """Remove the first @bot_username mention from a message."""
     pattern = rf"@{re.escape(bot_username)}\s*"
     cleaned = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE).strip()
     return cleaned if cleaned else "Що?"
 
 # ----------------------------------------------------------------------
-# Dummy TCP listener to open port immediately
+# Dummy TCP listener – keeps Render’s port alive while libraries load
 # ----------------------------------------------------------------------
-async def dummy_listener(port: int, stop_event: asyncio.Event):
-    """
-    Simple asyncio server that accepts connections and closes them.
-    Keeps the port open so Render considers the service ‘live’.
-    When `stop_event` is set, the server shuts down.
-    """
+async def dummy_listener(port: int):
     async def handle(reader, writer):
         writer.close()
-
     server = await asyncio.start_server(handle, "0.0.0.0", port)
-    logger.info(f"Dummy listener started on port {port}")
-    # Wait until we are told to stop
-    await stop_event.wait()
-    server.close()
-    await server.wait_closed()
-    logger.info("Dummy listener stopped.")
+    logger.info(f"Dummy listener on port {port} for Render")
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        server.close()
+        await server.wait_closed()
+        logger.info("Dummy listener stopped, port released.")
 
 # ----------------------------------------------------------------------
-# Late imports (heavy libraries loaded only after port is open)
+# Heavy imports (load after port is open)
 # ----------------------------------------------------------------------
 def load_heavy_modules():
-    """Import PTB, OpenAI, aiohttp – called after port is already bound."""
-    global telegram, openai, aiohttp_web
+    global telegram, openai, ChatAction, MessageEntityType
     from telegram import Update, Chat
     from telegram.constants import ChatAction
     from telegram import MessageEntity as MessageEntityType
     from telegram.ext import Application, MessageHandler, filters, ContextTypes
     import openai
-    from aiohttp import web as aiohttp_web
-
-    # Make them available globally
-    globals()["telegram"] = telegram
-    globals()["openai"] = openai
-    globals()["aiohttp_web"] = aiohttp_web
-    logger.info("Heavy modules loaded successfully.")
+    logger.info("PTB & OpenAI loaded.")
 
 # ----------------------------------------------------------------------
-# Cerebras API
+# Cerebras API & memory
 # ----------------------------------------------------------------------
 def get_cerebras_client():
-    key = os.environ["CEREBRAS_API_KEY"]
-    return openai.AsyncOpenAI(api_key=key, base_url="https://api.cerebras.ai/v1")
-
-async def generate_ai_response(user_message: str) -> str:
-    client = get_cerebras_client()
-    system_prompt = (
-        "Ти - український козак на ім'я Синевир із Галичини. "
-        "Говори галицьким діалектом, використовуй автентичну лексику, "
-        "приказки, вульгаризми. Відповідай дотепно, сміливо, з козацькою вдачею. "
-        "Відповідай українською мовою або суржиком."
+    return openai.AsyncOpenAI(
+        api_key=os.environ["CEREBRAS_API_KEY"],
+        base_url="https://api.cerebras.ai/v1",
     )
+
+# Maximum history length (number of messages), to keep API costs reasonable
+MAX_HISTORY = 20
+
+SYSTEM_PROMPT = (
+    "Ти - український козак на ім'я Синевир із Галичини. "
+    "Говори галицьким діалектом, використовуй автентичну лексику, "
+    "приказки, вульгаризми. Відповідай дотепно, сміливо, з козацькою вдачею. "
+    "Відповідай українською мовою або суржиком. "
+    "Пам'ятай попередні повідомлення цієї розмови."
+)
+
+async def generate_ai_response(chat_data: dict, user_message: str) -> str:
+    """Call Cerebras with conversation history from chat_data."""
+    client = get_cerebras_client()
+
+    # Retrieve or initialise history
+    history = chat_data.setdefault("history", [])
+    # Append the new user message
+    history.append({"role": "user", "content": user_message})
+    # Trim history if too long (keep the last MAX_HISTORY * 2 entries, i.e. user+assistant pairs)
+    if len(history) > MAX_HISTORY * 2:
+        history = history[-(MAX_HISTORY * 2):]
+        chat_data["history"] = history
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+
     response = await client.chat.completions.create(
         model="zai-glm-4.7",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
+        messages=messages,
         temperature=0.9,
         max_tokens=500,
     )
     content = response.choices[0].message.content.strip()
     if not content:
         raise ValueError("Empty response from Cerebras")
-    return content
 
-# ----------------------------------------------------------------------
-# Health check endpoint (optional, can be added to the bot’s web app)
-# ----------------------------------------------------------------------
-async def health(request):
-    return aiohttp_web.Response(text="Ок, я Синевир!")
+    # Store assistant response in history
+    history.append({"role": "assistant", "content": content})
+    # Trim again after adding
+    if len(history) > MAX_HISTORY * 2:
+        history = history[-(MAX_HISTORY * 2):]
+    chat_data["history"] = history
+
+    return content
 
 # ----------------------------------------------------------------------
 # Bot handlers
 # ----------------------------------------------------------------------
-async def process_and_reply(update, context, user_query):
+async def process_and_reply(update, context, user_query: str):
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
     try:
-        ai_raw = await generate_ai_response(user_query)
+        ai_raw = await generate_ai_response(context.chat_data, user_query)
         styled = stylize_response(ai_raw)
         await update.message.reply_text(styled, reply_to_message_id=update.message.message_id)
     except Exception as e:
-        logger.warning(f"AI/Parsing error: {e}")
+        logger.warning(f"AI or processing error: {e}")
         fallback = stylize_response("Синевир не при пам'яті, спробуй пізніше.")
         await update.message.reply_text(fallback, reply_to_message_id=update.message.message_id)
 
@@ -173,33 +194,68 @@ async def group_message_handler(update, context):
     chat = update.effective_chat
     if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
         return
+
     bot_username = context.bot.username.lower()
-    mentioned = False
-    is_reply = bool(msg.reply_to_message and msg.reply_to_message.from_user.id == context.bot.id)
+    text = msg.text
+
+    # Conditions to respond:
+    # 1. @mention
+    # 2. Direct reply to bot
+    # 3. Contains any trigger word
+    is_mention = False
     if msg.entities:
         for e in msg.entities:
             if e.type == MessageEntityType.MENTION:
-                if e.extract_from(msg.text).lower() == f"@{bot_username}":
-                    mentioned = True
+                if e.extract_from(text).lower() == f"@{bot_username}":
+                    is_mention = True
                     break
-    if not (mentioned or is_reply):
+
+    is_reply_to_bot = (
+        msg.reply_to_message and msg.reply_to_message.from_user.id == context.bot.id
+    )
+
+    has_trigger = contains_trigger(text)
+
+    if not (is_mention or is_reply_to_bot or has_trigger):
         return
-    query = msg.text if is_reply else remove_mention(msg.text, bot_username)
+
+    # Determine the actual query to send to the AI
+    if is_reply_to_bot:
+        # Use the whole message
+        query = text
+    elif is_mention and not has_trigger:
+        # Only mention, remove it
+        query = remove_mention(text, bot_username)
+    elif has_trigger and not is_mention:
+        # Only keyword, keep whole message
+        query = text
+    else:
+        # Both mention and keyword – remove mention to avoid redundancy
+        query = remove_mention(text, bot_username)
+
     await process_and_reply(update, context, query)
 
 # ----------------------------------------------------------------------
-# Build and run the real bot
+# Main – dummy listener → load libs → set webhook → PTB server
 # ----------------------------------------------------------------------
-async def start_real_bot(port: int, stop_event: asyncio.Event):
-    """Load PTB, set webhook, create the aiohttp app, and replace dummy listener."""
-    # 1. Load heavy libraries
+async def main():
+    # 1. Check env
+    token = os.environ.get("TELEGRAM_TOKEN")
+    cerebras = os.environ.get("CEREBRAS_API_KEY")
+    external_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not token or not cerebras or not external_url:
+        logger.critical("Missing TELEGRAM_TOKEN, CEREBRAS_API_KEY, or RENDER_EXTERNAL_URL")
+        sys.exit(1)
+    port = int(os.environ.get("PORT", 8443))
+
+    # 2. Dummy listener
+    dummy_task = asyncio.create_task(dummy_listener(port))
+    await asyncio.sleep(0.2)
+
+    # 3. Load heavy libs
     load_heavy_modules()
 
-    token = os.environ["TELEGRAM_TOKEN"]
-    external_url = os.environ["RENDER_EXTERNAL_URL"]
-    webhook_url = f"{external_url}/{token}"
-
-    # 2. Build Application
+    # 4. Build PTB app
     application = Application.builder().token(token).build()
     application.add_handler(
         MessageHandler(
@@ -208,59 +264,37 @@ async def start_real_bot(port: int, stop_event: asyncio.Event):
         )
     )
 
-    # 3. Set webhook
-    success = await application.bot.set_webhook(url=webhook_url)
-    if not success:
-        logger.critical("Telegram webhook setup failed.")
+    # 5. Set webhook
+    webhook_url = f"{external_url}/{token}"
+    try:
+        ok = await application.bot.set_webhook(url=webhook_url)
+        if not ok:
+            logger.critical("Telegram rejected webhook")
+            sys.exit(1)
+        logger.info(f"Webhook set: {webhook_url}")
+    except Exception as e:
+        logger.critical(f"Webhook setup failed: {e}")
         sys.exit(1)
-    logger.info(f"Webhook set: {webhook_url}")
 
-    # 4. Create aiohttp web app with health endpoint + PTB webhook handler
-    web_app = aiohttp_web.Application()
-    web_app.add_routes([aiohttp_web.get("/health", health)])
-    # Add PTB’s internal handler (the bot will register its route)
-    await application.initialize()
-    # PTB v20.8: we can get the webhook handler via a method
-    bot_webhook_handler = application.updater._webhook_handler  # not ideal but works
-    if not bot_webhook_handler:
-        # Fallback: use application.create_webhook_handler()
-        from telegram.ext._webhookhandler import WebhookHandler
-        # We'll add route manually
+    # 6. Stop dummy, start PTB server
+    dummy_task.cancel()
+    try:
+        await dummy_task
+    except asyncio.CancelledError:
         pass
-    else:
-        web_app.router.add_post(f"/{token}", bot_webhook_handler)
-
-    # 5. Stop the dummy listener and start the real server on the same port
-    stop_event.set()  # signal dummy listener to stop
-    await asyncio.sleep(0.5)  # give it time to release the port
-
-    # 6. Run the aiohttp web app
-    runner = aiohttp_web.AppRunner(web_app)
-    await runner.setup()
-    site = aiohttp_web.TCPSite(runner, "0.0.0.0", port)
-    logger.info(f"Real bot server started on port {port}")
-    await site.start()
-    # Keep running forever
-    while True:
-        await asyncio.sleep(3600)
-
-# ----------------------------------------------------------------------
-# Main entry point
-# ----------------------------------------------------------------------
-async def main():
-    # Always start the dummy listener first
-    port = int(os.environ.get("PORT", 8443))
-    stop_event = asyncio.Event()
-    dummy_task = asyncio.create_task(dummy_listener(port, stop_event))
-    # Give the dummy a moment to bind
-    await asyncio.sleep(0.2)
-
-    # Now start the real bot (this will eventually stop the dummy)
-    await start_real_bot(port, stop_event)
+    logger.info(f"Port {port} released, starting PTB webhook server...")
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=token,
+        webhook_url=webhook_url,
+    )
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
-        print(f"Fatal error: {e}", flush=True)
+        print(f"Fatal: {e}", flush=True)
         sys.exit(1)
