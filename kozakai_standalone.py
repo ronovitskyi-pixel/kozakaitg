@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 """
-KozakAI – Синевир (guaranteed webhook fix)
-============================================
-- Single aiohttp server that starts instantly (port opens immediately).
-- Loads PTB + Cerebras after port is open.
-- Adds Telegram webhook route dynamically.
-- Answers in groups when:
+KOZAKAI – Синевир (final production bot)
+==========================================
+- Binds port IMMEDIATELY → Render sees live service.
+- After loading PTB, seamlessly switches to the real webhook server.
+- Replies in group chats when:
     * @kozak_aibot is mentioned
-    * you reply to the bot
+    * you reply to one of its messages
     * text contains: козак, козаче, друже, синевир, синевире, козакai, kozakai, синевирai
 - Memory: last 20 messages per chat.
-- /ping command to test connectivity.
+- Commands: /ping → "Я тут!", /status → webhook info.
 """
 
-import os, sys, re, random, logging, asyncio
+import os, sys, re, random, logging, asyncio, signal
 
 # ----------------------------------------------------------------------
-# Immediate setup (no heavy imports)
+# IMMEDIATE OUTPUT (Render logs)
 # ----------------------------------------------------------------------
-print("=== Синевир v2 starting ===", flush=True)
+print("=== Синевир v3 STARTING ===", flush=True)
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -27,17 +26,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Синевир")
 
-# Character constants
-OPENINGS = ["Ото ж бо, ", "Гей-гей, козаче, ", "Слухай сюди, ", "А може, ",
-            "Ой, лишенько, ", "Йой, ", "Но-но, ", "Та й що, "]
-CLOSINGS = [" Аякже!", " Чи не так?", " Та й годі!", " От і вся правда.",
-            " А ти як думав?", " Хіба ж не так?", " Бодай тобі!", ""]
-SWEAR_WORDS = ["курва", "шляк", "лайдак", "зараза", "бодай тебе",
-               "чорт", "дідько", "матері його ковінька", "псяча віра", "сто чортів"]
-
-# Trigger keywords
-TRIGGERS = ["козак", "козаче", "друже", "синевир", "синевире",
-            "козакai", "kozakai", "синевирai"]
+# ----------------------------------------------------------------------
+# Kozak flavour constants
+# ----------------------------------------------------------------------
+OPENINGS = [
+    "Ото ж бо, ", "Гей-гей, козаче, ", "Слухай сюди, ", "А може, ",
+    "Ой, лишенько, ", "Йой, ", "Но-но, ", "Та й що, ",
+]
+CLOSINGS = [
+    " Аякже!", " Чи не так?", " Та й годі!", " От і вся правда.",
+    " А ти як думав?", " Хіба ж не так?", " Бодай тобі!", "",
+]
+SWEAR_WORDS = [
+    "курва", "шляк", "лайдак", "зараза", "бодай тебе",
+    "чорт", "дідько", "матері його ковінька", "псяча віра", "сто чортів",
+]
 
 def stylize(text: str) -> str:
     if not text:
@@ -48,6 +51,14 @@ def stylize(text: str) -> str:
         text = f"{random.choice(SWEAR_WORDS)}, {text}"
     return f"{opening}{text}{closing}".strip()
 
+# ----------------------------------------------------------------------
+# Trigger keywords
+# ----------------------------------------------------------------------
+TRIGGERS = [
+    "козак", "козаче", "друже", "синевир", "синевире",
+    "козакai", "kozakai", "синевирai",
+]
+
 def has_trigger(text: str) -> bool:
     return any(w in text.lower() for w in TRIGGERS)
 
@@ -57,41 +68,37 @@ def remove_mention(text: str, bot_uname: str) -> str:
     return cleaned or "Що?"
 
 # ----------------------------------------------------------------------
-# Light health‑check server (opens the port immediately)
+# Minimal aiohttp server that opens the port IMMEDIATELY
 # ----------------------------------------------------------------------
 from aiohttp import web
 
-async def health(request):
-    return web.Response(text="OK")
+async def health_check(request):
+    return web.Response(text="Healthy")
 
-# We'll store the real webhook handler here later
-WEBHOOK_HANDLER = None
-
-async def webhook_route(request):
-    """Forward the POST request to PTB's webhook handler."""
-    if WEBHOOK_HANDLER is None:
-        return web.Response(text="Not ready", status=503)
-    return await WEBHOOK_HANDLER(request)
-
-async def start_initial_server(port: int) -> web.Application:
-    """Create an aiohttp app with /health and a placeholder webhook route."""
+async def start_health_server(port: int):
+    """Start an aiohttp server that only serves /health."""
     app = web.Application()
-    app.router.add_get("/health", health)
-    # The webhook route will be added later (POST) – we add it now as a placeholder
-    app.router.add_post("/{token}", webhook_route)
-    return app
+    app.router.add_get("/health", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"⚡ Health server bound to port {port}")
+    return runner, site
 
 # ----------------------------------------------------------------------
-# Heavy imports (done after port is bound)
+# Heavy imports (loaded AFTER port is open)
 # ----------------------------------------------------------------------
 def load_libraries():
     global telegram, openai, ChatAction, MessageEntityType
     from telegram import Update, Chat
     from telegram.constants import ChatAction
     from telegram import MessageEntity as MessageEntityType
-    from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+    from telegram.ext import (
+        Application, MessageHandler, filters, ContextTypes, CommandHandler,
+    )
     import openai
-    logger.info("Libraries loaded")
+    logger.info("📚 Libraries loaded")
 
 # ----------------------------------------------------------------------
 # Cerebras & memory
@@ -110,15 +117,19 @@ async def generate_ai(chat_data: dict, user_msg: str) -> str:
     )
     history = chat_data.setdefault("history", [])
     history.append({"role": "user", "content": user_msg})
-    while len(history) > 40:          # keep last 20 exchanges
+    # Keep last 20 exchanges (40 messages)
+    while len(history) > 40:
         history.pop(0)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
     resp = await client.chat.completions.create(
-        model="zai-glm-4.7", messages=messages, temperature=0.9, max_tokens=500
+        model="zai-glm-4.7",
+        messages=messages,
+        temperature=0.9,
+        max_tokens=500,
     )
     content = resp.choices[0].message.content.strip()
     if not content:
-        raise ValueError("Empty Cerebras response")
+        raise ValueError("Empty response from Cerebras")
     history.append({"role": "assistant", "content": content})
     while len(history) > 40:
         history.pop(0)
@@ -130,17 +141,25 @@ async def generate_ai(chat_data: dict, user_msg: str) -> str:
 async def ping_cmd(update, context):
     await update.message.reply_text("Я тут! Синевир на зв'язку. ⚔️")
 
+async def status_cmd(update, context):
+    try:
+        info = await context.bot.get_webhook_info()
+        msg = f"Webhook URL: {info.url}\nPending: {info.pending_update_count}\nLast error: {info.last_error_message}"
+    except Exception as e:
+        msg = f"Не можу отримати статус: {e}"
+    await update.message.reply_text(msg)
+
 async def group_handler(update, context):
     msg = update.message
     if not msg or not msg.text:
         return
     chat = update.effective_chat
-    logger.info(f"Msg: chat={chat.id} user={msg.from_user.username} text={msg.text[:50]}")
+    text = msg.text
+    logger.info(f"📩 [{chat.id}] {msg.from_user.first_name}: {text[:60]}")
 
     if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
         return
 
-    text = msg.text
     bot_uname = context.bot.username.lower()
     is_mention = any(
         e.type == MessageEntityType.MENTION and
@@ -148,58 +167,52 @@ async def group_handler(update, context):
         for e in (msg.entities or [])
     )
     is_reply = msg.reply_to_message and msg.reply_to_message.from_user.id == context.bot.id
-    has_kw = has_trigger(text)
+    is_keyword = has_trigger(text)
 
-    logger.info(f"Flags: mention={is_mention}, reply={is_reply}, keyword={has_kw}")
-
-    if not (is_mention or is_reply or has_kw):
+    if not (is_mention or is_reply or is_keyword):
         return
 
-    # Build query
+    # Build the query to send to AI
     if is_reply:
         query = text
-    elif is_mention and not has_kw:
+    elif is_mention and not is_keyword:
         query = remove_mention(text, bot_uname)
     else:
         query = text if not is_mention else remove_mention(text, bot_uname)
 
-    logger.info(f"Processing: {query}")
+    logger.info(f"🧠 Processing: {query}")
     await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
     try:
         ai_reply = await generate_ai(context.chat_data, query)
         await msg.reply_text(stylize(ai_reply))
-        logger.info("Reply sent")
+        logger.info("✅ Reply sent")
     except Exception as e:
-        logger.warning(f"AI error: {e}")
+        logger.error(f"AI error: {e}")
         await msg.reply_text(stylize("Синевир не при пам'яті, спробуй пізніше."))
 
 # ----------------------------------------------------------------------
-# Main
+# Main orchestration
 # ----------------------------------------------------------------------
 async def main():
+    # Environment checks
     token = os.environ.get("TELEGRAM_TOKEN")
     cerebras = os.environ.get("CEREBRAS_API_KEY")
     ext_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not token or not cerebras or not ext_url:
-        logger.critical("Missing TELEGRAM_TOKEN, CEREBRAS_API_KEY or RENDER_EXTERNAL_URL")
+        logger.critical("❌ Missing TELEGRAM_TOKEN, CEREBRAS_API_KEY, or RENDER_EXTERNAL_URL")
         sys.exit(1)
     port = int(os.environ.get("PORT", 8443))
 
-    # 1. Start initial server (port opens immediately)
-    app = await start_initial_server(port)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"Initial HTTP server listening on port {port}")
+    # 1. Start health server IMMEDIATELY
+    health_runner, health_site = await start_health_server(port)
 
-    # 2. Load PTB & OpenAI (port stays open)
+    # 2. Now load heavy libraries (port stays open)
     load_libraries()
 
     # 3. Build PTB application
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("ping", ping_cmd))
-    # Catch all text messages in groups – our handler will filter internally
+    application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(
         MessageHandler(filters.ChatType.GROUPS & filters.TEXT, group_handler)
     )
@@ -211,24 +224,23 @@ async def main():
     webhook_url = f"{ext_url}/{token}"
     ok = await application.bot.set_webhook(url=webhook_url)
     if not ok:
-        logger.critical("Telegram rejected webhook URL")
+        logger.critical("❌ Telegram rejected webhook")
         sys.exit(1)
-    logger.info(f"Webhook set → {webhook_url}")
+    logger.info(f"🌐 Webhook set → {webhook_url}")
 
-    # Log webhook info
-    info = await application.bot.get_webhook_info()
-    logger.info(f"Webhook info: {info}")
+    # 5. Stop health server, release port
+    await health_site.stop()
+    await health_runner.cleanup()
+    logger.info("🛑 Health server stopped, port released")
 
-    # 5. Replace placeholder webhook route with real PTB handler
-    global WEBHOOK_HANDLER
-    # Get the internal aiohttp handler from PTB's updater
-    WEBHOOK_HANDLER = application.updater._webhook_handler
-    # The route is already defined as POST /{token} → webhook_route, which now forwards
-    logger.info("Webhook route activated")
-
-    # Keep running forever
-    while True:
-        await asyncio.sleep(3600)
+    # 6. Start PTB webhook server on the same port (this call blocks forever)
+    logger.info(f"🚀 Starting PTB webhook server on port {port}")
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=token,
+        webhook_url=webhook_url,
+    )
 
 if __name__ == "__main__":
     try:
@@ -236,5 +248,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        logger.critical(f"Fatal: {e}", exc_info=True)
+        logger.critical(f"💥 Fatal: {e}", exc_info=True)
         sys.exit(1)
