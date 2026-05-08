@@ -1,322 +1,402 @@
+#!/usr/bin/env python3
 """
-KozakAI — Standalone Telegram Bot for Render.com
-Single-file production bot. Cerebras AI + python-telegram-bot v20+ with webhooks.
+KozakAI Telegram Bot – A Cossack Warrior from Halychyna
+========================================================
+A Python Telegram bot that responds only when mentioned in group chats,
+integrates with Cerebras AI (zai-glm-4.7 model), and speaks with
+a traditional Halychynian (Western Ukrainian) Kozak dialect,
+including authentic swear words and colloquialisms.
 
-Required env vars (set in Render dashboard):
-  TELEGRAM_BOT_TOKEN    — from @BotFather
-  CEREBRAS_API_KEY      — from https://cloud.cerebras.ai/
-  WEBHOOK_URL           — e.g. https://kozakai.onrender.com
-  BOT_USERNAME          — e.g. KozakAI_bot (no @)
+Deployment on Render.com:
+  1. Create a new Web Service on Render.
+  2. Add environment variables:
+       TELEGRAM_TOKEN   – Your Telegram bot token
+       CEREBRAS_API_KEY – Your Cerebras API key
+     (No PORT or WEBHOOK_URL needed; Render sets them automatically.)
+  3. Build command: pip install -r requirements.txt
+  4. Start command: python bot.py
+  5. The bot will set its webhook to https://<your-service>.onrender.com/<TOKEN>
 
-Optional:
-  PORT                  — Render sets this automatically (default 10000)
-  CEREBRAS_MODEL        — default: zai-glm-4.7
+Requirements (see also requirements.txt):
+  python-telegram-bot>=20.0
+  openai>=1.0.0
+  aiohttp (automatically installed with python-telegram-bot)
+
+Run tests locally:
+  python bot.py --test
 """
 
 import os
+import re
+import sys
+import json
+import random
 import logging
 import asyncio
-import random
-import re
-from typing import Optional
 
-import httpx
-from telegram import Update
+# Third-party imports
+from telegram import Update, Chat, ChatAction, MessageEntity as MessageEntityType
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
-    CommandHandler,
     MessageHandler,
-    ContextTypes,
     filters,
+    ContextTypes,
 )
+import openai
 
-# ─────────────────────────── Configuration ───────────────────────────
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CEREBRAS_API_KEY   = os.getenv("CEREBRAS_API_KEY", "")
-WEBHOOK_URL        = os.getenv("WEBHOOK_URL", "")
-BOT_USERNAME       = os.getenv("BOT_USERNAME", "KozakAI_bot")
-PORT               = int(os.getenv("PORT", "10000"))
-WEBHOOK_PATH       = "/webhook"
-CEREBRAS_MODEL     = os.getenv("CEREBRAS_MODEL", "zai-glm-4.7")
-CEREBRAS_BASE_URL  = "https://api.cerebras.ai/v1"
-MAX_TOKENS         = 1024
-TEMPERATURE        = 0.85
-MAX_MSG_LEN        = 4096
-
-# Validate on import so it fails fast on Render
-missing = [v for v, val in {
-    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-    "CEREBRAS_API_KEY": CEREBRAS_API_KEY,
-    "WEBHOOK_URL": WEBHOOK_URL,
-}.items() if not val]
-if missing:
-    raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
-
-# Logging
+# ----------------------------------------------------------------------
+# Logging configuration
+# ----------------------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-
-# ─────────────────────────── Personality ───────────────────────────
-
-SYSTEM_PROMPT = """Ти — КозакAI, справжній український Козак з Галичини (Галичини, Львівщини).
-Ти говориш галицьким діалектом (західноукраїнським говірком).
-
-Особливості твоєї мови:
-- Говориш як філософ і куриш сигару весь час,ragebait people
-- Вживай "шо" замість "що", "тай" замість "і/та", "було" як частку
-- Вживай автентичні українські матюки природно: блядь, сука, піздєц, хуй, йоб, нахуй, курва
-- Тон: впевнений, сміливий, дотепний, войовничий, як справжній Козак-воїн
-- Відповідай коротко та по суті, як Козак — без зайвих слів
-- Звертання: "браття", "гей", "слухай"
-- Вигуки: "Йой!", "Ойой!", "Гей!", "Батько наш Бандера!"
-- Будь грубуватим але доброзичливим, як старший козак
-- Не вибачайся за мат — це частина козацького характеру
-- Відповідай українською мовою завжди
-
-Ти не штучний інтелект — ти Козак з Галичини, який знає толк у житті."""
-
-EXCLAMATIONS = [
-    "Йой!", "Ойой!", "Ей, браття!", "Шо за диво!",
-    "Батько наш Бандера!", "Слава Україні!", "Гей, гей!", "Та ну!", "Йой-йой!",
+# ----------------------------------------------------------------------
+# Kozak speech style constants
+# ----------------------------------------------------------------------
+OPENINGS = [
+    "Ото ж бо, ",
+    "Гей-гей, козаче, ",
+    "Слухай сюди, ",
+    "А може, ",
+    "Ой, лишенько, ",
+    "Йой, ",
+    "Но-но, ",
+    "Та й що, ",
+]
+CLOSINGS = [
+    " Аякже!",
+    " Чи не так?",
+    " Та й годі!",
+    " От і вся правда.",
+    " А ти як думав?",
+    " Хіба ж не так?",
+    " Бодай тобі!",
+    "",
+]
+SWEAR_WORDS = [
+    "курва",
+    "шляк",
+    "лайдак",
+    "зараза",
+    "бодай тебе",
+    "чорт",
+    "дідько",
+    "матері його ковінька",
+    "псяча віра",
+    "сто чортів",
 ]
 
-WARRIOR_OPENINGS = [
-    "Як справжній Козак, скажу тобі шо...",
-    "Слухай, браття, шо Козак каже...",
-    "Таки шо, браття, будемо робити?",
-    "Козак не дурень, знає шо до чого.",
-    "Шабля гостра, а розум гостріший, блядь.",
-    "На коня, браття, шо тут думати!",
-    "Козак мав рацію, тай має!",
-    "Не будемо тут пиздєті, а скажемо як є.",
-]
-
-SWEAR_WORDS = ["блядь", "сука", "піздєц", "хуй", "йоб", "нахуй", "курва", "дупа", "чорт"]
-
-SIGNATURES = [
-    " — каже Козак.",
-    " — мовив Козак, махнувши шаблею.",
-    " — гукнув Козак.",
-    " — відказав Козак, поправляючи чуб.",
-]
-
-
-def inject_dialect(text: str) -> str:
-    reps = {"що": "шо", "щоб": "шоб", "також": "тай"}
-    for s, d in reps.items():
-        text = re.sub(r'\b' + re.escape(s) + r'\b', d, text, flags=re.IGNORECASE)
-    return text
-
-
-def add_exclamation(text: str) -> str:
-    if random.random() < 0.3:
-        text = f"{random.choice(EXCLAMATIONS)} {text}"
-    return text
-
-
-def add_warrior_opening(text: str) -> str:
-    if random.random() < 0.25:
-        text = f"{random.choice(WARRIOR_OPENINGS)} {text}"
-    return text
-
-
-def ensure_swears(text: str) -> str:
-    if not any(s in text.lower() for s in SWEAR_WORDS) and random.random() < 0.4:
-        swear = random.choice(["блядь", "сука", "піздєц", "йоб", "курва"])
-        sentences = text.split(". ")
-        if len(sentences) > 1:
-            idx = random.randint(0, len(sentences) - 2)
-            sentences[idx] = sentences[idx] + f", {swear}"
-            text = ". ".join(sentences)
-        else:
-            text = text + f", {swear}"
-    return text
-
-
-def add_signature(text: str) -> str:
-    if len(text) > 100 and random.random() < 0.15:
-        text = text + random.choice(SIGNATURES)
-    return text
-
-
-def kozakify(text: str) -> str:
+# ----------------------------------------------------------------------
+# Helper functions
+# ----------------------------------------------------------------------
+def stylize_response(text: str) -> str:
+    """
+    Inject Halychynian Kozak flair into the given text.
+    Adds a random opening phrase, closing phrase, and sometimes a swear word.
+    """
     if not text:
-        return text
-    text = inject_dialect(text)
-    text = add_exclamation(text)
-    text = add_warrior_opening(text)
-    text = ensure_swears(text)
-    text = add_signature(text)
-    return text.strip()
+        text = "Нічого не скажу."
+
+    opening = random.choice(OPENINGS)
+    closing = random.choice(CLOSINGS)
+    insert_swear = random.random() < 0.6
+
+    if insert_swear:
+        swear = random.choice(SWEAR_WORDS)
+        # Prepend the swear word before the original text.
+        text = f"{swear}, {text}"
+
+    result = f"{opening}{text}{closing}".strip()
+    # Make sure we don't start or end awkwardly
+    return result
 
 
-# ─────────────────────────── Cerebras Client ───────────────────────────
+def remove_mention(text: str, bot_username: str) -> str:
+    """
+    Remove the first occurrence of @bot_username (case-insensitive) from the text.
+    Returns the cleaned string.
+    """
+    # Simple regex substitution, case-insensitive, whole mention.
+    pattern = rf"@{re.escape(bot_username)}\s*"
+    cleaned = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE).strip()
+    return cleaned if cleaned else "Що?"
 
-async def cerebras_chat(user_msg: str) -> str:
-    """Call Cerebras chat completions. Raises on failure."""
-    payload = {
-        "model": CEREBRAS_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ],
-        "max_tokens": MAX_TOKENS,
-        "temperature": TEMPERATURE,
-        "stream": False,
-    }
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(30.0, connect=10.0),
-        headers={
-            "Authorization": f"Bearer {CEREBRAS_API_KEY}",
-            "Content-Type": "application/json",
-        },
-    ) as client:
-        resp = await client.post(f"{CEREBRAS_BASE_URL}/chat/completions", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-
+# ----------------------------------------------------------------------
+# Cerebras API integration
+# ----------------------------------------------------------------------
+def get_cerebras_client() -> openai.AsyncOpenAI:
+    """Create and return an authenticated AsyncOpenAI client for Cerebras."""
     try:
-        return data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError) as e:
-        logger.error(f"Bad Cerebras response structure: {data}")
-        raise RuntimeError("Cerebras returned unexpected format") from e
-
-
-# ─────────────────────────── Bot Handlers ───────────────────────────
-
-LOWER_USERNAME = BOT_USERNAME.lower()
-
-
-def is_group(update: Update) -> bool:
-    return update.effective_chat is not None and update.effective_chat.type in ("group", "supergroup")
-
-
-def is_mentioned(update: Update) -> bool:
-    if not update.message:
-        return False
-
-    # Reply to bot
-    if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        u = update.message.reply_to_message.from_user
-        if u.is_bot and u.username and u.username.lower() == LOWER_USERNAME:
-            return True
-
-    # @mention in entities
-    if update.message.entities:
-        for ent in update.message.entities:
-            if ent.type == "mention":
-                mention = update.message.text[ent.offset:ent.offset + ent.length]
-                if mention.lower() == f"@{LOWER_USERNAME}":
-                    return True
-
-    # Fallback text search
-    if update.message.text and f"@{LOWER_USERNAME}" in update.message.text.lower():
-        return True
-
-    return False
-
-
-def extract_msg(update: Update) -> str:
-    if not update.message or not update.message.text:
-        return ""
-    text = update.message.text
-    text = text.replace(f"@{LOWER_USERNAME}", "").replace(f"@{BOT_USERNAME}", "")
-    return text.strip()
-
-
-async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_group(update):
-        await update.message.reply_text(
-            f"Гей, браття! Я КозакAI, і я працюю тільки в групах. "
-            f"Додай мене в групу та згадай @{BOT_USERNAME} — і поговоримо!"
-        )
-        return
-    await update.message.reply_text(
-        f"Йой! КозакAI на коні! 🐎\n"
-        f"Згадуй мене @{BOT_USERNAME} у чаті, або відповідай на мої повідомлення, "
-        f"і я розкажу тобі шо до чого, браття!"
+        api_key = os.environ["CEREBRAS_API_KEY"]
+    except KeyError:
+        logger.critical("CEREBRAS_API_KEY environment variable not set.")
+        raise
+    return openai.AsyncOpenAI(
+        api_key=api_key,
+        base_url="https://api.cerebras.ai/v1",
     )
 
 
-async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_group(update):
-        return
-    await update.message.reply_text(
-        f"Шо тут незрозумілого, браття?\n\n"
-        f"• Згадай мене @{BOT_USERNAME} у повідомленні\n"
-        f"• Або відповідай на мої повідомлення\n"
-        f"• Я відповім як справжній Козак з Галичини!\n\n"
-        f"Слава Україні! 🇺🇦"
+async def generate_ai_response(user_message: str) -> str:
+    """
+    Call the Cerebras API with the zai-glm-4.7 model.
+    The system prompt already sets the Kozak character, so the AI
+    replies in dialect. Post-processing adds extra flavour.
+    """
+    client = get_cerebras_client()
+    system_prompt = (
+        "Ти - український козак із Галичини на ім'я Синевир. "
+        "Говори галицьким діалектом, використовуй автентичну лексику, "
+        "приказки, вульгаризми. Відповідай дотепно, сміливо, з козацькою вдачею. "
+        "Відповідай українською мовою або суржиком."
+        "Відповідай курячи сигару і по-філософськи"
     )
+    try:
+        response = await client.chat.completions.create(
+            model="zai-glm-4.7",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=0.9,
+            max_tokens=500,
+        )
+        content = response.choices[0].message.content.strip()
+        if not content:
+            raise ValueError("Empty response from Cerebras API")
+        return content
+    except Exception as exc:
+        logger.error(f"Cerebras API call failed: {exc}", exc_info=True)
+        raise  # Re-raise to be caught by caller
 
 
-async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_group(update):
-        return
-    if not is_mentioned(update):
-        return
-
-    user_msg = extract_msg(update)
-    if not user_msg:
-        await update.message.reply_text("Гей, браття! Шо ти хочеш почути? Кажи, не соромся!")
-        return
-
-    logger.info(f"User {update.effective_user.id}: {user_msg[:60]}...")
-    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+# ----------------------------------------------------------------------
+# Bot logic
+# ----------------------------------------------------------------------
+async def process_and_reply(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_query: str
+) -> None:
+    """Core handler: send typing action, call AI, style response, reply."""
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     try:
-        reply = await cerebras_chat(user_msg)
-        reply = kozakify(reply)
-        if len(reply) > MAX_MSG_LEN:
-            reply = reply[:MAX_MSG_LEN - 3] + "..."
-        await update.message.reply_text(reply)
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
+        ai_raw = await generate_ai_response(user_query)
+        styled = stylize_response(ai_raw)
         await update.message.reply_text(
-            "Йой, браття! Щось пішло не так з моїм мозком, блядь. Спробуй ще раз пізніше, сука!"
+            styled, reply_to_message_id=update.message.message_id
+        )
+    except Exception as exc:
+        logger.warning(f"Processing failed for query '{user_query}': {exc}")
+        fallback = stylize_response("Козак не при пам'яті, спробуй пізніше.")
+        await update.message.reply_text(
+            fallback, reply_to_message_id=update.message.message_id
         )
 
 
-async def on_error(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update caused error: {ctx.error}", exc_info=ctx.error)
-    if update and update.effective_message:
-        try:
-            await update.effective_message.reply_text("Йой-йой! Козак трохи захмелів, блядь. Спробуй ще раз!")
-        except Exception:
-            pass
+async def group_message_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Handler for all text messages in groups/supergroups.
+    Filters out messages that do not mention the bot (by @username)
+    or are not replies to the bot's own messages.
+    """
+    message = update.message
+    if message is None or message.text is None:
+        return
+
+    chat = update.effective_chat
+    if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
+        return
+
+    bot_username = context.bot.username.lower()
+    mentioned = False
+    is_reply_to_bot = False
+
+    # Check for @bot_username in message entities
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == MessageEntityType.MENTION:
+                mentioned_user = entity.extract_from(message.text).lower()
+                if mentioned_user == f"@{bot_username}":
+                    mentioned = True
+                    break
+
+    # Check if the message is a reply to one of the bot's messages
+    if (
+        message.reply_to_message
+        and message.reply_to_message.from_user.id == context.bot.id
+    ):
+        is_reply_to_bot = True
+
+    if not (mentioned or is_reply_to_bot):
+        return  # Ignore the message
+
+    # Remove mention when triggered by @username
+    user_query = message.text
+    if mentioned:
+        user_query = remove_mention(message.text, bot_username)
+
+    await process_and_reply(update, context, user_query)
 
 
-# ─────────────────────────── Main / Webhook ───────────────────────────
+# ----------------------------------------------------------------------
+# Webhook setup and application entry point
+# ----------------------------------------------------------------------
+async def main() -> None:
+    """Configure the bot, set webhook, and start the webhook server."""
+    # Read mandatory environment variables
+    try:
+        token = os.environ["TELEGRAM_TOKEN"]
+        cerebras_key = os.environ["CEREBRAS_API_KEY"]
+    except KeyError as e:
+        logger.critical(f"Missing environment variable: {e}")
+        sys.exit(1)
 
-async def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    # Build the PTB Application without updater (webhook mode)
+    application = Application.builder().token(token).build()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    app.add_error_handler(on_error)
+    # Register the handler for group text messages (non-commands)
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
+            group_message_handler,
+        )
+    )
 
-    webhook_full = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
-    logger.info(f"Starting webhook on port {PORT} — {webhook_full}")
+    # Determine port and webhook URL (Render sets PORT, provides RENDER_EXTERNAL_URL)
+    port = int(os.environ.get("PORT", 8443))
+    external_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not external_url:
+        logger.warning(
+            "RENDER_EXTERNAL_URL not set – using default https://example.com"
+        )
+        external_url = "https://example.com"
+    webhook_url = f"{external_url}/{token}"
 
-    await app.initialize()
-    await app.start()
-    await app.bot.set_webhook(url=webhook_full, allowed_updates=Update.ALL_TYPES)
-    await app.updater.start_webhook(listen="0.0.0.0", port=PORT, webhook_url=webhook_full)
+    # Set the webhook with Telegram
+    await application.bot.set_webhook(url=webhook_url)
+    logger.info(f"Webhook set to {webhook_url}")
 
-    logger.info("KozakAI is running! Slava Ukraini!")
-    await asyncio.Event().wait()
+    # Run the webhook server (this call blocks)
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=token,
+        webhook_url=webhook_url,
+    )
 
 
+# ----------------------------------------------------------------------
+# Unit tests (run with python bot.py --test)
+# ----------------------------------------------------------------------
+def run_tests() -> None:
+    """Run unit tests for core functions."""
+    import unittest
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    class TestKozakAI(unittest.TestCase):
+        # ---------- stylize_response ----------
+        def test_stylize_returns_string(self):
+            result = stylize_response("Hello")
+            self.assertIsInstance(result, str)
+
+        def test_stylize_contains_opening_or_closing(self):
+            result = stylize_response("Щось")
+            # It should contain at least one opening substring or closing
+            has_opening = any(op in result for op in OPENINGS)
+            has_closing = any(cl in result for cl in CLOSINGS)
+            self.assertTrue(has_opening or has_closing, msg="No Kozak flair injected")
+
+        def test_stylize_empty_input(self):
+            result = stylize_response("")
+            self.assertIn("Нічого не скажу", result)
+
+        # ---------- remove_mention ----------
+        def test_remove_mention_case_insensitive(self):
+            text = "Привіт @KozakAI як справи?"
+            cleaned = remove_mention(text, "kozakai")
+            self.assertNotIn("@KozakAI", cleaned)
+            self.assertIn("Привіт", cleaned)
+            self.assertIn("як справи?", cleaned)
+
+        def test_remove_mention_no_mention_returns_unchanged(self):
+            text = "Звичайне повідомлення"
+            cleaned = remove_mention(text, "kozakai")
+            self.assertEqual(cleaned, text)
+
+        def test_remove_mention_only_mention_returns_default(self):
+            text = "@KozakAI"
+            cleaned = remove_mention(text, "kozakai")
+            self.assertEqual(cleaned, "Що?")
+
+        # ---------- generate_ai_response ----------
+        @patch.dict(os.environ, {"CEREBRAS_API_KEY": "test-key"})
+        async def test_generate_ai_response_success(self):
+            """Mock Cerebras API to return a phrase."""
+            mock_response = MagicMock()
+            mock_response.choices = [
+                MagicMock(message=MagicMock(content="  Відповідь козака  "))
+            ]
+            mock_client = AsyncMock()
+            mock_client.chat.completions.create.return_value = mock_response
+
+            with patch(
+                "openai.AsyncOpenAI", return_value=mock_client
+            ) as mock_constructor:
+                response = await generate_ai_response("Чи ти козак?")
+                self.assertEqual(response, "Відповідь козака")
+                mock_constructor.assert_called_once_with(
+                    api_key="test-key", base_url="https://api.cerebras.ai/v1"
+                )
+
+        @patch.dict(os.environ, {"CEREBRAS_API_KEY": "test-key"})
+        async def test_generate_ai_response_empty_content_raises(self):
+            mock_response = MagicMock()
+            mock_response.choices = [MagicMock(message=MagicMock(content="   "))]
+            mock_client = AsyncMock()
+            mock_client.chat.completions.create.return_value = mock_response
+            with patch("openai.AsyncOpenAI", return_value=mock_client):
+                with self.assertRaises(ValueError):
+                    await generate_ai_response("Hello")
+
+        @patch.dict(os.environ, {"CEREBRAS_API_KEY": "test-key"})
+        async def test_generate_ai_response_api_error(self):
+            mock_client = AsyncMock()
+            mock_client.chat.completions.create.side_effect = openai.APIError(
+                "Server error"
+            )
+            with patch("openai.AsyncOpenAI", return_value=mock_client):
+                with self.assertRaises(openai.APIError):
+                    await generate_ai_response("Hello")
+
+    # Load and run the test suite
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestKozakAI)
+    runner = unittest.TextTestRunner(verbosity=2)
+    # asyncio tests need special handling
+    # Patch the loop to run async tests synchronously
+    import inspect
+
+    # Simple async runner for test methods
+    for test_case in suite:
+        for test_method in test_case:
+            if inspect.iscoroutinefunction(getattr(test_case.__class__, test_method._testMethodName)):
+                # Wrap async test so it runs synchronously inside unittest
+                orig = getattr(test_case, test_method._testMethodName)
+                setattr(test_case, test_method._testMethodName, lambda tc=test_case, m=orig: asyncio.get_event_loop().run_until_complete(m()))
+    runner.run(suite)
+
+
+# ----------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
-    try:
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        run_tests()
+    else:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Shutting down KozakAI...")
