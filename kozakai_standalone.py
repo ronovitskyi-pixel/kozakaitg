@@ -1,225 +1,109 @@
 #!/usr/bin/env python3
 """
-KOZAKAI – Синевир (with aggressive debug prints)
-==================================================
-- Prints every step to stdout.  
-- Catches library load errors immediately.
-- If Cerebras key is missing, bot still replies to /ping.
+SIMPLEST DEBUG BOT – writes to /tmp/bot.log AND stdout
 """
 
-import os, sys, re, random, logging, asyncio
+import sys, os, asyncio, time, traceback
 
-print("=== Синевир v4 STARTING ===", flush=True)
+# Create a log file early
+LOG = open("/tmp/bot.log", "w")
+def log(msg):
+    line = f"{time.strftime('%H:%M:%S')} {msg}"
+    print(line, flush=True)
+    LOG.write(line + "\n")
+    LOG.flush()
 
-logging.basicConfig(
-    stream=sys.stdout,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("Синевир")
+log("=== BOT STARTING (minimal) ===")
 
-# ----------------------------------------------------------------------
-# Kozak flair
-# ----------------------------------------------------------------------
-OPENINGS = ["Ото ж бо, ", "Гей-гей, козаче, ", "Слухай сюди, ", "А може, ",
-            "Ой, лишенько, ", "Йой, ", "Но-но, ", "Та й що, "]
-CLOSINGS = [" Аякже!", " Чи не так?", " Та й годі!", " От і вся правда.",
-            " А ти як думав?", " Хіба ж не так?", " Бодай тобі!", ""]
-SWEAR_WORDS = ["курва", "шляк", "лайдак", "зараза", "бодай тебе",
-               "чорт", "дідько", "матері його ковінька", "псяча віра", "сто чортів"]
+# 1. Check env
+for var in ["TELEGRAM_TOKEN", "CEREBRAS_API_KEY", "RENDER_EXTERNAL_URL"]:
+    if var not in os.environ:
+        log(f"MISSING ENV: {var}")
+        sys.exit(1)
 
-def stylize(text):
-    if not text:
-        text = "Нічого не скажу."
-    opening = random.choice(OPENINGS)
-    closing = random.choice(CLOSINGS)
-    if random.random() < 0.6:
-        text = f"{random.choice(SWEAR_WORDS)}, {text}"
-    return f"{opening}{text}{closing}".strip()
+log("ENV vars present")
+port = int(os.environ.get("PORT", 8443))
+log(f"PORT={port}")
 
-TRIGGERS = ["козак", "козаче", "друже", "синевир", "синевире",
-            "козакai", "kozakai", "синевирai"]
+# 2. Try importing aiohttp alone
+try:
+    log("Importing aiohttp...")
+    from aiohttp import web
+    log("aiohttp imported OK")
+except Exception as e:
+    log(f"aiohttp import FAILED: {e}")
+    traceback.print_exc(file=LOG)
+    sys.exit(1)
 
-def has_trigger(text):
-    return any(w in text.lower() for w in TRIGGERS)
-
-def remove_mention(text, bot_uname):
-    pattern = rf"@{re.escape(bot_uname)}\s*"
-    cleaned = re.sub(pattern, "", text, 1, flags=re.IGNORECASE).strip()
-    return cleaned or "Що?"
-
-# ----------------------------------------------------------------------
-# Immediate health server
-# ----------------------------------------------------------------------
-from aiohttp import web
-
+# 3. Start minimal HTTP server
 async def health(request):
     return web.Response(text="OK")
 
-# ----------------------------------------------------------------------
-# Heavy library loading WITH EXCEPTION TRAPS
-# ----------------------------------------------------------------------
-def load_libraries():
-    global openai, ChatAction, MessageEntityType, Application, MessageHandler, filters, ContextTypes, CommandHandler, Update, Chat
-
-    print("➡️ Importing telegram...", flush=True)
-    try:
-        from telegram import Update, Chat
-        from telegram.constants import ChatAction
-        from telegram import MessageEntity as MessageEntityType
-        from telegram.ext import (
-            Application, MessageHandler, filters, ContextTypes, CommandHandler,
-        )
-        print("✅ telegram imported", flush=True)
-    except Exception as e:
-        print(f"❌ Failed to import telegram: {e}", flush=True)
-        raise
-
-    print("➡️ Importing openai...", flush=True)
-    try:
-        import openai
-        print("✅ openai imported", flush=True)
-    except Exception as e:
-        print(f"❌ Failed to import openai: {e}", flush=True)
-        raise
-
-    print("📚 All libraries loaded", flush=True)
-
-# ----------------------------------------------------------------------
-# Cerebras (with fallback)
-# ----------------------------------------------------------------------
-SYSTEM_PROMPT = (
-    "Ти - український козак на ім'я Синевир із Галичини. "
-    "Говори галицьким діалектом, використовуй автентичну лексику, "
-    "приказки, вульгаризми. Відповідай дотепно, сміливо, з козацькою вдачею. "
-    "Пам'ятай попередні повідомлення цієї розмови."
-)
-
-async def generate_ai(chat_data, user_msg):
-    key = os.environ.get("CEREBRAS_API_KEY")
-    if not key:
-        raise Exception("CEREBRAS_API_KEY not set")
-
-    client = openai.AsyncOpenAI(api_key=key, base_url="https://api.cerebras.ai/v1")
-    history = chat_data.setdefault("history", [])
-    history.append({"role": "user", "content": user_msg})
-    while len(history) > 40:
-        history.pop(0)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-    resp = await client.chat.completions.create(
-        model="zai-glm-4.7",
-        messages=messages,
-        temperature=0.9,
-        max_tokens=500,
-    )
-    content = resp.choices[0].message.content.strip()
-    if not content:
-        raise ValueError("Empty response")
-    history.append({"role": "assistant", "content": content})
-    while len(history) > 40:
-        history.pop(0)
-    return content
-
-# ----------------------------------------------------------------------
-# Handlers
-# ----------------------------------------------------------------------
-async def ping_cmd(update, context):
-    await update.message.reply_text("Я тут! Синевир на зв'язку. ⚔️")
-
-async def group_handler(update, context):
-    msg = update.message
-    if not msg or not msg.text:
-        return
-    chat = update.effective_chat
-    text = msg.text
-    logger.info(f"📩 [{chat.id}] {msg.from_user.first_name}: {text[:60]}")
-
-    if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
-        return
-
-    bot_uname = context.bot.username.lower()
-    is_mention = any(
-        e.type == MessageEntityType.MENTION and
-        e.extract_from(text).lower() == f"@{bot_uname}"
-        for e in (msg.entities or [])
-    )
-    is_reply = msg.reply_to_message and msg.reply_to_message.from_user.id == context.bot.id
-    is_keyword = has_trigger(text)
-
-    if not (is_mention or is_reply or is_keyword):
-        return
-
-    if is_reply:
-        query = text
-    elif is_mention and not is_keyword:
-        query = remove_mention(text, bot_uname)
-    else:
-        query = text if not is_mention else remove_mention(text, bot_uname)
-
-    logger.info(f"🧠 Processing: {query}")
-    await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
-    try:
-        ai_reply = await generate_ai(context.chat_data, query)
-        await msg.reply_text(stylize(ai_reply))
-        logger.info("✅ Reply sent")
-    except Exception as e:
-        logger.error(f"AI error: {e}")
-        await msg.reply_text(stylize("Синевир не при пам'яті, спробуй пізніше."))
-
-# ----------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------
-async def main():
-    print("🔍 Checking environment...", flush=True)
-    token = os.environ.get("TELEGRAM_TOKEN")
-    ext_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if not token or not ext_url:
-        logger.critical("❌ Missing TELEGRAM_TOKEN or RENDER_EXTERNAL_URL")
-        sys.exit(1)
-    port = int(os.environ.get("PORT", 8443))
-
-    # 1. Start health server immediately
+async def start_health():
     app = web.Application()
-    app.router.add_get("/health", health)
+    app.router.add_get("/", health)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"⚡ Health server on port {port}", flush=True)
+    log(f"Health server running on port {port}")
+    return runner, site
 
-    # 2. Load heavy libs WITH debug
+# 4. Try importing PTB components one by one
+async def test_imports():
+    log("Importing telegram...")
+    from telegram import Update
+    log("Importing telegram.ext...")
+    from telegram.ext import Application
+    log("Importing ChatAction...")
+    from telegram.constants import ChatAction
+    log("All telegram imports OK")
+    return Application
+
+async def main():
+    runner, site = await start_health()
+
+    # Test PTB import
     try:
-        load_libraries()
+        app_class = await test_imports()
+        log("PTB imports successful")
     except Exception as e:
-        print(f"💀 Library load failed: {e}", flush=True)
-        sys.exit(1)
+        log(f"PTB import failed: {e}")
+        traceback.print_exc(file=LOG)
+        # keep health server alive so we can see logs
+        while True:
+            await asyncio.sleep(3600)
 
-    # 3. Build PTB
-    print("🔧 Building PTB application...", flush=True)
-    application = Application.builder().token(token).build()
-    application.add_handler(CommandHandler("ping", ping_cmd))
-    application.add_handler(
-        MessageHandler(filters.ChatType.GROUPS & filters.TEXT, group_handler)
-    )
+    # Build minimal bot that only answers /ping
+    token = os.environ["TELEGRAM_TOKEN"]
+    ext_url = os.environ["RENDER_EXTERNAL_URL"]
+    webhook_url = f"{ext_url}/{token}"
+
+    application = app_class.builder().token(token).build()
+
+    async def ping(update, context):
+        await update.message.reply_text("PONG")
+        log("Ping replied")
+
+    from telegram.ext import CommandHandler
+    application.add_handler(CommandHandler("ping", ping))
+
     await application.initialize()
     await application.start()
-    print("🔧 PTB initialized", flush=True)
+    log("Application started")
 
-    # 4. Set webhook
-    webhook_url = f"{ext_url}/{token}"
     ok = await application.bot.set_webhook(url=webhook_url)
-    if not ok:
-        logger.critical("❌ Telegram rejected webhook")
-        sys.exit(1)
-    print(f"🌐 Webhook set to {webhook_url}", flush=True)
+    log(f"Webhook set: {webhook_url} result={ok}")
 
-    # 5. Stop health server, release port
+    if not ok:
+        log("Webhook failed, exiting")
+        sys.exit(1)
+
+    # Stop health server
     await site.stop()
     await runner.cleanup()
-    print("🛑 Health server stopped", flush=True)
+    log("Health server stopped, starting PTB webhook...")
 
-    # 6. Start PTB webhook server
-    print(f"🚀 Starting PTB webhook server on port {port}...", flush=True)
     await application.run_webhook(
         listen="0.0.0.0",
         port=port,
@@ -231,5 +115,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception as e:
-        print(f"💥 Fatal: {e}", flush=True)
-        sys.exit(1)
+        log(f"FATAL: {e}")
+        traceback.print_exc(file=LOG)
