@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: kozakai-ai
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: venv/bin/python kozakai_standalone.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.9
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: CEREBRAS_API_KEY
+        sync: false
